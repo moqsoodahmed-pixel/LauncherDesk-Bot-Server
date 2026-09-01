@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Environment files — NEVER commit these
+.env
+.env.local
+.env.production
+server/.env
+client/.env
+
+# Build outputs
+client/dist/
+server/dist/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Cache
+.npm/
+.eslintcache
+.parcel-cache/
+
+# Coverage
+coverage/
+.nyc_output/
+
+# Docker volumes (local)
+mongo_data/
