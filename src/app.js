@@ -25,6 +25,9 @@ const logRoutes = require('./routes/logs');
 
 const app = express();
 
+// Trust proxy for Render deployment
+app.set('trust proxy', 1);
+
 // Connect to MongoDB
 connectDB();
 

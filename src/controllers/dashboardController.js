@@ -75,7 +75,7 @@ exports.getLeadsByTeam = async (req, res, next) => {
     const results = await Lead.aggregate([
       { $group: { _id: '$assignedTeam', count: { $sum: 1 } } },
       { $lookup: { from: 'teams', localField: '_id', foreignField: '_id', as: 'team' } },
-      { $unwind: { path: '$team', preserveNullAndEmpty: true } },
+      { $unwind: { path: "$team", preserveNullAndEmptyArrays: true } },
       { $project: { team: { $ifNull: ['$team.name', 'Unassigned'] }, count: 1 } },
       { $sort: { count: -1 } },
     ]);
