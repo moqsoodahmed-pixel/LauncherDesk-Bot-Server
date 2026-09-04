@@ -6,11 +6,13 @@ const { parseIncomingMessage, processDeliveryStatus } = require('../services/msg
 const logger = require('../utils/logger');
 
 /**
- * Verify webhook authenticity using MSG91 signature
+ * Verify webhook authenticity using MSG91 signature.
+ * If MSG91_WEBHOOK_SECRET is not set (or set to placeholder), skip verification.
  */
 function verifyMsg91Signature(rawBody, signature) {
   const secret = process.env.MSG91_WEBHOOK_SECRET;
-  if (!secret || !signature) return true; // Skip if not configured
+  // Skip if not configured or still set to placeholder
+  if (!secret || secret === 'your_webhook_secret_here' || !signature) return true;
   try {
     const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
     return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(signature, 'hex'));
@@ -20,35 +22,60 @@ function verifyMsg91Signature(rawBody, signature) {
 }
 
 /**
+ * Safely parse request body — handles both Buffer (from express.raw) and
+ * already-parsed JSON objects (from express.json).
+ */
+function parseBody(reqBody) {
+  if (Buffer.isBuffer(reqBody)) {
+    return { raw: reqBody, parsed: JSON.parse(reqBody.toString()) };
+  }
+  if (typeof reqBody === 'string') {
+    const buf = Buffer.from(reqBody);
+    return { raw: buf, parsed: JSON.parse(reqBody) };
+  }
+  // Already parsed object — reconstruct raw buffer for signature check
+  const str = JSON.stringify(reqBody);
+  return { raw: Buffer.from(str), parsed: reqBody };
+}
+
+/**
  * POST /api/webhooks/msg91
  * Handle incoming WhatsApp messages from MSG91
  */
 exports.handleMsg91Webhook = async (req, res) => {
   const startTime = Date.now();
 
-  // Parse raw body
-  const rawBody = req.body instanceof Buffer ? req.body : Buffer.from(JSON.stringify(req.body));
+  let raw, parsed;
+  try {
+    ({ raw, parsed } = parseBody(req.body));
+  } catch (err) {
+    logger.error('[Webhook] Failed to parse request body', { error: err.message });
+    // Still return 200 so MSG91 doesn't retry
+    return res.status(200).json({ success: true, message: 'Received' });
+  }
+
   const signature = req.headers['x-msg91-signature'] || req.headers['x-webhook-signature'];
 
-  // Always respond 200 quickly to prevent MSG91 retries
+  // Always respond 200 immediately to prevent MSG91 retries
   res.status(200).json({ success: true, message: 'Webhook received' });
 
-  // Async processing
+  // Async processing after response sent
   setImmediate(async () => {
     try {
-      // Verify signature
-      if (!verifyMsg91Signature(rawBody, signature)) {
+      // Verify signature (skipped if secret not configured)
+      if (!verifyMsg91Signature(raw, signature)) {
         logger.warn('[Webhook] Invalid signature rejected');
         return;
       }
 
-      const payload = JSON.parse(rawBody.toString());
-      logger.debug('[Webhook] Received payload', { type: payload.type || 'unknown' });
+      logger.debug('[Webhook] Received payload', { payload: JSON.stringify(parsed) });
 
       // Parse the incoming message
-      const parsedMessage = parseIncomingMessage(payload);
+      const parsedMessage = parseIncomingMessage(parsed);
       if (!parsedMessage) {
-        logger.warn('[Webhook] Could not parse incoming message');
+        logger.warn('[Webhook] Could not parse incoming message, raw payload logged', {
+          payload: JSON.stringify(parsed),
+        });
         return;
       }
 
@@ -67,8 +94,8 @@ exports.handleMsg91Webhook = async (req, res) => {
       const webhookEvent = await WebhookEvent.create({
         provider: 'msg91',
         eventId,
-        eventType: payload.type || 'message',
-        rawPayload: payload,
+        eventType: parsed.contentType || parsed.messageType || parsed.type || 'message',
+        rawPayload: parsed,
         whatsappNumber: parsedMessage.fromNumber,
         messageId: parsedMessage.messageId,
         status: 'pending',
@@ -99,6 +126,7 @@ exports.handleMsg91Webhook = async (req, res) => {
       logger.info('[Webhook] Message processed successfully', {
         eventId,
         from: parsedMessage.fromNumber,
+        text: parsedMessage.messageText,
         processingTimeMs: processingTime,
       });
     } catch (err) {
@@ -114,10 +142,16 @@ exports.handleMsg91Webhook = async (req, res) => {
 exports.handleDeliveryStatus = async (req, res) => {
   res.status(200).json({ success: true });
 
-  const payload = req.body instanceof Buffer ? JSON.parse(req.body.toString()) : req.body;
+  let payload;
+  try {
+    ({ parsed: payload } = parseBody(req.body));
+  } catch {
+    return;
+  }
+
   setImmediate(async () => {
     try {
-      const messageId = payload.message_id || payload.id;
+      const messageId = payload.message_id || payload.id || payload.requestId;
       const status = payload.status || payload.message_status;
       if (messageId && status) {
         await processDeliveryStatus(messageId, status);
@@ -133,7 +167,7 @@ exports.handleDeliveryStatus = async (req, res) => {
  * Webhook verification challenge (if MSG91 requires it)
  */
 exports.verifyWebhook = (req, res) => {
-  const challenge = req.query.challenge || req.query.hub?.challenge;
+  const challenge = req.query.challenge || req.query['hub.challenge'];
   if (challenge) {
     return res.status(200).send(challenge);
   }

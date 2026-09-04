@@ -38,7 +38,7 @@ async function sendMessage(toNumber, payload, conversationId, leadId) {
     payload,
     conversationId,
     leadId,
-    status: 'sent',
+    status: 'pending',
   });
 
   if (!AUTH_KEY || !SENDER_NUMBER) {
@@ -46,17 +46,17 @@ async function sendMessage(toNumber, payload, conversationId, leadId) {
       to: toNumber,
       type: payload.type,
     });
+    await MessageLog.findByIdAndUpdate(logEntry._id, { status: 'dry_run' });
     return { success: true, dryRun: true, logId: logEntry._id };
   }
 
   try {
+    const msg91Payload = buildMSG91Payload(toNumber, payload);
+    logger.debug('[MSG91] Sending payload', { to: toNumber, type: payload.type, payload: JSON.stringify(msg91Payload) });
+
     const response = await axios.post(
       `${BASE_URL}/whatsapp/whatsapp-outbound-message/bulk/`,
-      {
-        integrated_number: SENDER_NUMBER,
-        content_type: 'template',
-        ...buildMSG91Payload(toNumber, payload),
-      },
+      msg91Payload,
       { headers: getHeaders(), timeout: 10000 }
     );
 
@@ -66,11 +66,11 @@ async function sendMessage(toNumber, payload, conversationId, leadId) {
       metadata: { response: response.data },
     });
 
-    logger.info('[MSG91] Message sent', { to: toNumber, type: payload.type, msgId: response.data?.message_id });
+    logger.info('[MSG91] Message sent', { to: toNumber, type: payload.type, response: response.data });
     return { success: true, messageId: response.data?.message_id, logId: logEntry._id };
   } catch (error) {
     const errMsg = error.response?.data ? JSON.stringify(error.response.data) : error.message;
-    logger.error('[MSG91] Failed to send message', { to: toNumber, error: errMsg });
+    logger.error('[MSG91] Failed to send message', { to: toNumber, error: errMsg, status: error.response?.status });
 
     await MessageLog.findByIdAndUpdate(logEntry._id, {
       status: 'failed',
@@ -83,11 +83,15 @@ async function sendMessage(toNumber, payload, conversationId, leadId) {
 
 /**
  * Build MSG91-compatible payload structure.
- * MSG91 WhatsApp API uses a "data" array format for bulk sends.
+ * MSG91 WhatsApp API v5 bulk format.
  */
 function buildMSG91Payload(toNumber, payload) {
+  const integrated_number = SENDER_NUMBER;
+
   if (payload.type === 'text') {
     return {
+      integrated_number,
+      content_type: 'text',
       data: [
         {
           to: toNumber,
@@ -100,6 +104,8 @@ function buildMSG91Payload(toNumber, payload) {
 
   if (payload.type === 'button') {
     return {
+      integrated_number,
+      content_type: 'interactive',
       data: [
         {
           to: toNumber,
@@ -111,7 +117,7 @@ function buildMSG91Payload(toNumber, payload) {
               action: {
                 buttons: payload.buttons.map((btn, i) => ({
                   type: 'reply',
-                  reply: { id: btn.id || `btn_${i}`, title: btn.label.slice(0, 20) },
+                  reply: { id: btn.id || `btn_${i}`, title: String(btn.label).slice(0, 20) },
                 })),
               },
             },
@@ -123,6 +129,8 @@ function buildMSG91Payload(toNumber, payload) {
 
   if (payload.type === 'list') {
     return {
+      integrated_number,
+      content_type: 'interactive',
       data: [
         {
           to: toNumber,
@@ -136,9 +144,9 @@ function buildMSG91Payload(toNumber, payload) {
                 sections: payload.sections || [
                   {
                     title: payload.sectionTitle || 'Options',
-                    rows: payload.options.map((opt, i) => ({
+                    rows: (payload.options || []).map((opt, i) => ({
                       id: opt.id || `opt_${i}`,
-                      title: opt.label.slice(0, 24),
+                      title: String(opt.label).slice(0, 24),
                       description: opt.description || '',
                     })),
                   },
@@ -151,8 +159,24 @@ function buildMSG91Payload(toNumber, payload) {
     };
   }
 
+  if (payload.type === 'template') {
+    return {
+      integrated_number,
+      content_type: 'template',
+      data: [
+        {
+          to: toNumber,
+          type: 'template',
+          message: payload.template,
+        },
+      ],
+    };
+  }
+
   // Fallback: plain text
   return {
+    integrated_number,
+    content_type: 'text',
     data: [
       {
         to: toNumber,
@@ -222,7 +246,6 @@ async function sendListMessage(toNumber, body, options, sectionTitle, conversati
 
 /**
  * Fallback: numbered text list
- * Used when interactive messages are unavailable or option count exceeds limits
  */
 async function sendNumberedTextMessage(toNumber, body, options, conversationId, leadId) {
   const numbered = options.map((opt, i) => `${i + 1}. ${opt.label}`).join('\n');
@@ -232,7 +255,6 @@ async function sendNumberedTextMessage(toNumber, body, options, conversationId, 
 
 /**
  * Send a WhatsApp template message
- * Used for session re-initiation (MSG91 requires template for 24h+ inactive users)
  */
 async function sendTemplateMessage(toNumber, templateName, variables, conversationId) {
   const payload = {
@@ -265,21 +287,92 @@ async function processDeliveryStatus(messageId, status) {
 }
 
 /**
- * Parse an incoming MSG91 WhatsApp webhook payload
- * Returns a normalized message object regardless of MSG91 payload format
+ * Parse an incoming MSG91 WhatsApp webhook payload.
+ *
+ * MSG91 sends the payload with these top-level fields (as per their webhook config):
+ *   customerNumber, integratedNumber, contentType, text, messageType,
+ *   interactive, button, messages, ts, etc.
+ *
+ * Returns a normalized message object.
  */
 function parseIncomingMessage(rawBody) {
   try {
     const body = typeof rawBody === 'string' ? JSON.parse(rawBody) : rawBody;
 
-    // MSG91 may send different payload shapes depending on message type
-    // Normalize to a consistent internal format
-    let fromNumber, messageText, messageId, messageType, buttonPayload, interactivePayload, timestamp;
+    logger.debug('[MSG91] Raw webhook body', { body: JSON.stringify(body) });
 
-    // Handle MSG91 inbound format
-    if (body.data) {
+    let fromNumber, messageText, messageId, messageType, buttonPayload, timestamp;
+
+    // ── Format 1: MSG91 custom webhook payload (flat structure from their template) ──
+    // Fields: customerNumber, integratedNumber, contentType, text, messageType,
+    //         interactive, button, ts, messages, etc.
+    if (body.customerNumber || body.integratedNumber) {
+      fromNumber = body.customerNumber || body.from;
+      messageId = body.requestId || body.replyMsgId || body.uuid || `local_${Date.now()}`;
+      timestamp = body.ts ? parseInt(body.ts, 10) : Date.now();
+      messageType = (body.contentType || body.messageType || 'text').toLowerCase();
+
+      if (messageType === 'text' || (!messageType && body.text)) {
+        messageText = body.text;
+        messageType = 'text';
+      } else if (messageType === 'interactive' || body.interactive) {
+        // Parse interactive (button/list reply)
+        let interactive = body.interactive;
+        if (typeof interactive === 'string') {
+          try { interactive = JSON.parse(interactive); } catch (_) { interactive = {}; }
+        }
+        interactive = interactive || {};
+
+        if (interactive.type === 'button_reply') {
+          buttonPayload = {
+            id: interactive.button_reply?.id,
+            title: interactive.button_reply?.title,
+          };
+          messageText = interactive.button_reply?.title || interactive.button_reply?.id;
+          messageType = 'button_reply';
+        } else if (interactive.type === 'list_reply') {
+          buttonPayload = {
+            id: interactive.list_reply?.id,
+            title: interactive.list_reply?.title,
+          };
+          messageText = interactive.list_reply?.title || interactive.list_reply?.id;
+          messageType = 'list_reply';
+        } else {
+          messageText = body.text || JSON.stringify(interactive);
+          messageType = 'interactive';
+        }
+      } else if (messageType === 'button' || body.button) {
+        // Quick reply button tap
+        let btn = body.button;
+        if (typeof btn === 'string') {
+          try { btn = JSON.parse(btn); } catch (_) { btn = { text: btn }; }
+        }
+        btn = btn || {};
+        buttonPayload = { id: btn.payload || btn.id, title: btn.text || btn.title };
+        messageText = btn.text || btn.title || btn.payload;
+        messageType = 'button_reply';
+      } else if (body.text) {
+        messageText = body.text;
+        messageType = 'text';
+      } else if (body.messages) {
+        // Try to parse the messages field
+        let msgs = body.messages;
+        if (typeof msgs === 'string') {
+          try { msgs = JSON.parse(msgs); } catch (_) { msgs = null; }
+        }
+        if (Array.isArray(msgs) && msgs.length > 0) {
+          const m = msgs[0];
+          fromNumber = fromNumber || m.from;
+          messageText = m.text?.body || m.text || m.message || '';
+          messageType = m.type || 'text';
+          messageId = m.id || messageId;
+        }
+      }
+    }
+    // ── Format 2: MSG91 data-wrapped format ──
+    else if (body.data) {
       const data = Array.isArray(body.data) ? body.data[0] : body.data;
-      fromNumber = data.from || data.sender || data.mobile;
+      fromNumber = data.from || data.sender || data.mobile || data.customerNumber;
       messageId = data.id || data.message_id || data.msg_id;
       timestamp = data.timestamp || data.time || Date.now();
 
@@ -300,14 +393,15 @@ function parseIncomingMessage(rawBody) {
       } else if (data.type === 'button') {
         buttonPayload = { id: data.button?.payload, title: data.button?.text };
         messageText = data.button?.text;
-        messageType = 'button';
+        messageType = 'button_reply';
       } else {
         messageText = data.message || data.body || '';
         messageType = data.type || 'text';
       }
-    } else {
-      // Try alternate format
-      fromNumber = body.from || body.sender || body.mobile;
+    }
+    // ── Format 3: Flat top-level format ──
+    else {
+      fromNumber = body.from || body.sender || body.mobile || body.customerNumber;
       messageId = body.id || body.message_id;
       messageText = body.text?.body || body.text || body.message || '';
       messageType = body.type || 'text';
@@ -315,24 +409,33 @@ function parseIncomingMessage(rawBody) {
     }
 
     if (!fromNumber) {
-      logger.warn('[MSG91] Could not extract sender from payload', { body });
+      logger.warn('[MSG91] Could not extract sender from payload', { body: JSON.stringify(body) });
       return null;
     }
 
-    return {
+    // Normalize timestamp
+    let parsedTimestamp;
+    if (typeof timestamp === 'number') {
+      // MSG91 sends seconds; JS needs ms
+      parsedTimestamp = timestamp > 1e10 ? new Date(timestamp) : new Date(timestamp * 1000);
+    } else {
+      parsedTimestamp = new Date();
+    }
+
+    const result = {
       fromNumber: String(fromNumber),
       messageText: (messageText || '').trim(),
       messageId: String(messageId || `local_${Date.now()}`),
-      messageType,
+      messageType: messageType || 'text',
       buttonPayload,
-      interactivePayload,
-      timestamp: new Date(
-        typeof timestamp === 'number' && timestamp > 1e10 ? timestamp : timestamp * 1000
-      ),
+      timestamp: parsedTimestamp,
       rawPayload: body,
     };
+
+    logger.debug('[MSG91] Parsed message', { result });
+    return result;
   } catch (err) {
-    logger.error('[MSG91] Failed to parse incoming message', { error: err.message });
+    logger.error('[MSG91] Failed to parse incoming message', { error: err.message, stack: err.stack });
     return null;
   }
 }

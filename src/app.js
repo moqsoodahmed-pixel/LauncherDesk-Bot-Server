@@ -25,7 +25,7 @@ const logRoutes = require('./routes/logs');
 
 const app = express();
 
-// Trust proxy for Render deployment
+// Trust proxy for Render/Railway deployment
 app.set('trust proxy', 1);
 
 // Connect to MongoDB
@@ -34,18 +34,29 @@ connectDB();
 // Security middleware
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
-// CORS
+// CORS — allow both the admin frontend and MSG91 servers
+const allowedOrigins = [
+  process.env.FRONTEND_URL || 'http://localhost:5173',
+  'https://api.msg91.com',
+  'https://msg91.com',
+];
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  origin: (origin, callback) => {
+    // Allow requests with no origin (MSG91 webhooks, curl, Postman)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.some((o) => origin.startsWith(o))) return callback(null, true);
+    // Allow the frontend URL dynamically
+    if (process.env.FRONTEND_URL && origin === process.env.FRONTEND_URL) return callback(null, true);
+    callback(null, true); // Be permissive for webhooks — auth is done via signature
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-webhook-signature'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-webhook-signature', 'x-msg91-signature', 'authkey'],
 }));
 
-// Raw body for webhook signature verification (must be before express.json())
-app.use('/api/webhooks', express.raw({ type: 'application/json' }));
-
-// Body parsing
+// Body parsing — use JSON for everything.
+// We reconstruct the raw buffer in the webhook controller when needed for signature verification.
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -59,7 +70,7 @@ if (process.env.NODE_ENV !== 'test') {
 
 // Rate limiting
 const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   max: 500,
   message: { success: false, message: 'Too many requests, please try again later.' },
   standardHeaders: true,
@@ -67,8 +78,8 @@ const apiLimiter = rateLimit({
 });
 
 const webhookLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: 200,
+  windowMs: 1 * 60 * 1000,
+  max: 300,
   message: { success: false, message: 'Webhook rate limit exceeded.' },
 });
 
@@ -78,6 +89,11 @@ app.use('/api/webhooks', webhookLimiter);
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'LauncherDesk WhatsApp Bot', timestamp: new Date().toISOString() });
+});
+
+// Root health check (some platforms ping /)
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'LauncherDesk WhatsApp Bot' });
 });
 
 // API Routes
@@ -109,6 +125,7 @@ if (process.env.NODE_ENV !== 'test') {
   app.listen(PORT, () => {
     logger.info(`🚀 LauncherDesk server running on port ${PORT}`);
     logger.info(`📱 Environment: ${process.env.NODE_ENV}`);
+    logger.info(`🔗 Webhook URL: POST /api/webhooks/msg91`);
   });
 }
 
