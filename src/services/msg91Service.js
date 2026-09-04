@@ -1,27 +1,21 @@
 /**
  * MSG91 WhatsApp Integration Service
  *
- * API Reference: https://docs.msg91.com/whatsapp
- * Base URL: https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/
+ * API: https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/
  *
- * Text message payload:
+ * NOTE: MSG91 interactive messages (buttons/lists) require specific account
+ * configuration and may not be available on all plans. This service sends
+ * all messages as plain text with numbered options as a reliable fallback.
+ *
+ * Text payload:
+ *   POST control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/
  *   { integrated_number, recipient_number, content_type: "text", text: "..." }
- *
- * Interactive button payload:
- *   { integrated_number, recipient_number, content_type: "interactive", message: { interactive: { type:"button", ... } } }
- *
- * Interactive list payload:
- *   { integrated_number, recipient_number, content_type: "interactive", message: { interactive: { type:"list", ... } } }
- *
- * Template (bulk) endpoint: /bulk/
- *   { integrated_number, content_type: "template", data: [{ to, type:"template", message: {...} }] }
  */
 
 const axios = require('axios');
 const logger = require('../utils/logger');
 const MessageLog = require('../models/MessageLog');
 
-// MSG91 correct base URL
 const BASE_URL = 'https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/';
 const AUTH_KEY = process.env.MSG91_AUTH_KEY;
 const SENDER_NUMBER = process.env.MSG91_WHATSAPP_NUMBER;
@@ -35,7 +29,7 @@ function getHeaders() {
 }
 
 /**
- * Core message sender
+ * Core sender — all messages go through here
  */
 async function sendMessage(toNumber, payload, conversationId, leadId) {
   const logEntry = await MessageLog.create({
@@ -50,15 +44,16 @@ async function sendMessage(toNumber, payload, conversationId, leadId) {
   });
 
   if (!AUTH_KEY || !SENDER_NUMBER) {
-    logger.warn('[MSG91] Credentials not configured — dry-run mode.', { to: toNumber });
+    logger.warn('[MSG91] Credentials not configured — dry-run.', { to: toNumber });
     return { success: true, dryRun: true, logId: logEntry._id };
   }
 
-  try {
-    const { endpoint, body } = buildMSG91Request(toNumber, payload);
-    logger.debug('[MSG91] Sending request', { endpoint, body: JSON.stringify(body) });
+  // Always convert to plain text — most reliable across all MSG91 plans
+  const textBody = toTextPayload(toNumber, payload);
+  logger.debug('[MSG91] Sending', { to: toNumber, body: JSON.stringify(textBody) });
 
-    const response = await axios.post(endpoint, body, {
+  try {
+    const response = await axios.post(BASE_URL, textBody, {
       headers: getHeaders(),
       timeout: 10000,
     });
@@ -69,130 +64,51 @@ async function sendMessage(toNumber, payload, conversationId, leadId) {
       metadata: { response: response.data },
     });
 
-    logger.info('[MSG91] Message sent successfully', { to: toNumber, type: payload.type, response: response.data });
+    logger.info('[MSG91] Sent OK', { to: toNumber, type: payload.type, res: response.data });
     return { success: true, messageId: response.data?.message_id, logId: logEntry._id };
   } catch (error) {
     const errMsg = error.response?.data ? JSON.stringify(error.response.data) : error.message;
-    logger.error('[MSG91] Failed to send message', { to: toNumber, error: errMsg, status: error.response?.status });
-
+    logger.error('[MSG91] Send failed', { to: toNumber, error: errMsg });
     await MessageLog.findByIdAndUpdate(logEntry._id, { status: 'failed', error: errMsg });
     return { success: false, error: errMsg, logId: logEntry._id };
   }
 }
 
 /**
- * Build the correct MSG91 API request based on message type.
- *
- * Returns { endpoint, body } where endpoint is the full URL to POST to.
+ * Convert any message type to a plain-text MSG91 payload.
+ * Buttons and lists are rendered as numbered text options.
  */
-function buildMSG91Request(toNumber, payload) {
-  const integrated_number = SENDER_NUMBER;
-  const recipient_number = toNumber;
+function toTextPayload(toNumber, payload) {
+  let text;
 
-  // ── Plain text ──────────────────────────────────────────────
   if (payload.type === 'text') {
-    return {
-      endpoint: BASE_URL,
-      body: {
-        integrated_number,
-        recipient_number,
-        content_type: 'text',
-        text: payload.text,
-      },
-    };
+    text = payload.text;
+
+  } else if (payload.type === 'button') {
+    const opts = (payload.buttons || [])
+      .map((b, i) => `${i + 1}. ${b.label || b.title}`)
+      .join('\n');
+    text = `${payload.body}\n\n${opts}\n\n_Reply with the number of your choice._`;
+
+  } else if (payload.type === 'list') {
+    const opts = (payload.options || [])
+      .map((o, i) => `${i + 1}. ${o.label}`)
+      .join('\n');
+    text = `${payload.body}\n\n${opts}\n\n_Reply with the number of your choice._`;
+
+  } else {
+    text = payload.text || JSON.stringify(payload);
   }
 
-  // ── Interactive buttons (max 3) ─────────────────────────────
-  if (payload.type === 'button') {
-    return {
-      endpoint: BASE_URL,
-      body: {
-        integrated_number,
-        recipient_number,
-        content_type: 'interactive',
-        message: {
-          interactive: {
-            type: 'button',
-            body: { text: payload.body },
-            action: {
-              buttons: payload.buttons.map((btn, i) => ({
-                type: 'reply',
-                reply: {
-                  id: String(btn.id || `btn_${i}`).slice(0, 256),
-                  title: String(btn.label || btn.title || '').slice(0, 20),
-                },
-              })),
-            },
-          },
-        },
-      },
-    };
-  }
-
-  // ── Interactive list ────────────────────────────────────────
-  if (payload.type === 'list') {
-    return {
-      endpoint: BASE_URL,
-      body: {
-        integrated_number,
-        recipient_number,
-        content_type: 'interactive',
-        message: {
-          interactive: {
-            type: 'list',
-            body: { text: payload.body },
-            action: {
-              button: (payload.buttonLabel || 'Select').slice(0, 20),
-              sections: payload.sections || [
-                {
-                  title: (payload.sectionTitle || 'Options').slice(0, 24),
-                  rows: (payload.options || []).map((opt, i) => ({
-                    id: String(opt.id || `opt_${i}`).slice(0, 200),
-                    title: String(opt.label || '').slice(0, 24),
-                    description: String(opt.description || '').slice(0, 72),
-                  })),
-                },
-              ],
-            },
-          },
-        },
-      },
-    };
-  }
-
-  // ── Template (uses /bulk/ endpoint) ────────────────────────
-  if (payload.type === 'template') {
-    return {
-      endpoint: `${BASE_URL}bulk/`,
-      body: {
-        integrated_number,
-        content_type: 'template',
-        data: [
-          {
-            to: toNumber,
-            type: 'template',
-            message: payload.template,
-          },
-        ],
-      },
-    };
-  }
-
-  // ── Fallback: plain text ────────────────────────────────────
   return {
-    endpoint: BASE_URL,
-    body: {
-      integrated_number,
-      recipient_number,
-      content_type: 'text',
-      text: payload.text || JSON.stringify(payload),
-    },
+    integrated_number: SENDER_NUMBER,
+    recipient_number: toNumber,
+    content_type: 'text',
+    text,
   };
 }
 
-// ─────────────────────────────────────────────────────────────
-// Public helper functions
-// ─────────────────────────────────────────────────────────────
+// ─── Public helpers ──────────────────────────────────────────
 
 async function sendTextMessage(toNumber, text, conversationId, leadId) {
   return sendMessage(toNumber, { type: 'text', text }, conversationId, leadId);
@@ -202,20 +118,11 @@ async function sendButtonMessage(toNumber, body, buttons, conversationId, leadId
   if (!buttons || buttons.length === 0) {
     return sendTextMessage(toNumber, body, conversationId, leadId);
   }
-  if (buttons.length <= 3) {
-    return sendMessage(toNumber, { type: 'button', body, buttons }, conversationId, leadId);
-  }
-  if (buttons.length <= 10) {
-    return sendListMessage(toNumber, body, buttons.map((b) => ({ id: b.id, label: b.label })), 'Options', conversationId, leadId);
-  }
-  return sendNumberedTextMessage(toNumber, body, buttons, conversationId, leadId);
+  return sendMessage(toNumber, { type: 'button', body, buttons }, conversationId, leadId);
 }
 
 async function sendListMessage(toNumber, body, options, sectionTitle, conversationId, leadId) {
-  if (options.length <= 10) {
-    return sendMessage(toNumber, { type: 'list', body, options, sectionTitle }, conversationId, leadId);
-  }
-  return sendNumberedTextMessage(toNumber, body, options, conversationId, leadId);
+  return sendMessage(toNumber, { type: 'list', body, options, sectionTitle }, conversationId, leadId);
 }
 
 async function sendNumberedTextMessage(toNumber, body, options, conversationId, leadId) {
@@ -225,17 +132,47 @@ async function sendNumberedTextMessage(toNumber, body, options, conversationId, 
 }
 
 async function sendTemplateMessage(toNumber, templateName, variables, conversationId) {
-  const payload = {
-    type: 'template',
-    template: {
-      name: templateName,
-      language: { code: 'en' },
-      components: variables
-        ? [{ type: 'body', parameters: variables.map((v) => ({ type: 'text', text: v })) }]
-        : [],
-    },
-  };
-  return sendMessage(toNumber, payload, conversationId);
+  // Templates use the bulk endpoint — keep separate
+  const integrated_number = SENDER_NUMBER;
+  const logEntry = await MessageLog.create({
+    direction: 'outgoing',
+    whatsappNumber: toNumber,
+    messageType: 'template',
+    content: templateName,
+    status: 'sent',
+    conversationId,
+  });
+
+  if (!AUTH_KEY || !SENDER_NUMBER) return { success: true, dryRun: true };
+
+  try {
+    const response = await axios.post(
+      `${BASE_URL}bulk/`,
+      {
+        integrated_number,
+        content_type: 'template',
+        data: [{
+          to: toNumber,
+          type: 'template',
+          message: {
+            name: templateName,
+            language: { code: 'en' },
+            components: variables
+              ? [{ type: 'body', parameters: variables.map((v) => ({ type: 'text', text: v })) }]
+              : [],
+          },
+        }],
+      },
+      { headers: getHeaders(), timeout: 10000 }
+    );
+    await MessageLog.findByIdAndUpdate(logEntry._id, { status: 'sent', metadata: { response: response.data } });
+    return { success: true };
+  } catch (error) {
+    const errMsg = error.response?.data ? JSON.stringify(error.response.data) : error.message;
+    logger.error('[MSG91] Template send failed', { error: errMsg });
+    await MessageLog.findByIdAndUpdate(logEntry._id, { status: 'failed', error: errMsg });
+    return { success: false, error: errMsg };
+  }
 }
 
 async function processDeliveryStatus(messageId, status) {
@@ -246,40 +183,37 @@ async function processDeliveryStatus(messageId, status) {
     );
     logger.info('[MSG91] Delivery status updated', { messageId, status });
   } catch (err) {
-    logger.error('[MSG91] Failed to update delivery status', { messageId, error: err.message });
+    logger.error('[MSG91] Status update failed', { error: err.message });
   }
 }
 
 /**
- * Parse an incoming MSG91 WhatsApp webhook payload.
- *
- * MSG91 sends flat fields: customerNumber, integratedNumber, contentType,
- * text, messageType, interactive, button, ts, messages, etc.
+ * Parse incoming MSG91 webhook payload.
+ * Handles all MSG91 payload shapes.
  */
 function parseIncomingMessage(rawBody) {
   try {
     const body = typeof rawBody === 'string' ? JSON.parse(rawBody) : rawBody;
-    logger.debug('[MSG91] Raw webhook body', { body: JSON.stringify(body) });
+    logger.debug('[MSG91] Raw webhook', { body: JSON.stringify(body) });
 
     let fromNumber, messageText, messageId, messageType, buttonPayload, timestamp;
 
-    // ── Format 1: MSG91 flat webhook payload ──────────────────
+    // Format 1: MSG91 flat webhook (customerNumber, contentType, text, interactive...)
     if (body.customerNumber || body.integratedNumber) {
       fromNumber = body.customerNumber || body.from;
       messageId = body.requestId || body.replyMsgId || body.uuid || `local_${Date.now()}`;
       timestamp = body.ts ? parseInt(body.ts, 10) : Date.now();
       messageType = (body.contentType || body.messageType || 'text').toLowerCase();
 
-      if (messageType === 'text' || body.text) {
+      if (body.text && (messageType === 'text' || !body.interactive)) {
         messageText = body.text;
         messageType = 'text';
-      } else if (messageType === 'interactive' || body.interactive) {
+      } else if (body.interactive || messageType === 'interactive') {
         let interactive = body.interactive;
         if (typeof interactive === 'string') {
           try { interactive = JSON.parse(interactive); } catch (_) { interactive = {}; }
         }
         interactive = interactive || {};
-
         if (interactive.type === 'button_reply') {
           buttonPayload = { id: interactive.button_reply?.id, title: interactive.button_reply?.title };
           messageText = interactive.button_reply?.title || interactive.button_reply?.id;
@@ -289,23 +223,21 @@ function parseIncomingMessage(rawBody) {
           messageText = interactive.list_reply?.title || interactive.list_reply?.id;
           messageType = 'list_reply';
         } else {
-          messageText = body.text || JSON.stringify(interactive);
-          messageType = 'interactive';
+          messageText = body.text || '';
         }
-      } else if (messageType === 'button' || body.button) {
+      } else if (body.button || messageType === 'button') {
         let btn = body.button;
-        if (typeof btn === 'string') {
-          try { btn = JSON.parse(btn); } catch (_) { btn = { text: btn }; }
-        }
+        if (typeof btn === 'string') { try { btn = JSON.parse(btn); } catch (_) { btn = { text: btn }; } }
         btn = btn || {};
         buttonPayload = { id: btn.payload || btn.id, title: btn.text || btn.title };
-        messageText = btn.text || btn.title || btn.payload;
+        messageText = btn.text || btn.title || btn.payload || '';
         messageType = 'button_reply';
+      } else if (body.text) {
+        messageText = body.text;
+        messageType = 'text';
       } else if (body.messages) {
         let msgs = body.messages;
-        if (typeof msgs === 'string') {
-          try { msgs = JSON.parse(msgs); } catch (_) { msgs = null; }
-        }
+        if (typeof msgs === 'string') { try { msgs = JSON.parse(msgs); } catch (_) { msgs = null; } }
         if (Array.isArray(msgs) && msgs.length > 0) {
           const m = msgs[0];
           fromNumber = fromNumber || m.from;
@@ -315,37 +247,32 @@ function parseIncomingMessage(rawBody) {
         }
       }
     }
-    // ── Format 2: data-wrapped ────────────────────────────────
+    // Format 2: data-wrapped
     else if (body.data) {
       const data = Array.isArray(body.data) ? body.data[0] : body.data;
       fromNumber = data.from || data.sender || data.mobile || data.customerNumber;
-      messageId = data.id || data.message_id || data.msg_id;
-      timestamp = data.timestamp || data.time || Date.now();
-
+      messageId = data.id || data.message_id;
+      timestamp = data.timestamp || Date.now();
       if (data.type === 'text' || data.text) {
         messageText = data.text?.body || data.text || data.message;
         messageType = 'text';
       } else if (data.type === 'interactive') {
-        const interactive = data.interactive || {};
-        if (interactive.type === 'button_reply') {
-          buttonPayload = { id: interactive.button_reply?.id, title: interactive.button_reply?.title };
-          messageText = interactive.button_reply?.title;
+        const iv = data.interactive || {};
+        if (iv.type === 'button_reply') {
+          buttonPayload = { id: iv.button_reply?.id, title: iv.button_reply?.title };
+          messageText = iv.button_reply?.title;
           messageType = 'button_reply';
-        } else if (interactive.type === 'list_reply') {
-          buttonPayload = { id: interactive.list_reply?.id, title: interactive.list_reply?.title };
-          messageText = interactive.list_reply?.title;
+        } else if (iv.type === 'list_reply') {
+          buttonPayload = { id: iv.list_reply?.id, title: iv.list_reply?.title };
+          messageText = iv.list_reply?.title;
           messageType = 'list_reply';
         }
-      } else if (data.type === 'button') {
-        buttonPayload = { id: data.button?.payload, title: data.button?.text };
-        messageText = data.button?.text;
-        messageType = 'button_reply';
       } else {
         messageText = data.message || data.body || '';
         messageType = data.type || 'text';
       }
     }
-    // ── Format 3: flat top-level ──────────────────────────────
+    // Format 3: flat top-level
     else {
       fromNumber = body.from || body.sender || body.mobile || body.customerNumber;
       messageId = body.id || body.message_id;
@@ -355,7 +282,7 @@ function parseIncomingMessage(rawBody) {
     }
 
     if (!fromNumber) {
-      logger.warn('[MSG91] Could not extract sender number', { body: JSON.stringify(body) });
+      logger.warn('[MSG91] No sender found', { body: JSON.stringify(body) });
       return null;
     }
 
@@ -376,10 +303,10 @@ function parseIncomingMessage(rawBody) {
       rawPayload: body,
     };
 
-    logger.debug('[MSG91] Parsed incoming message', { result });
+    logger.debug('[MSG91] Parsed', { result });
     return result;
   } catch (err) {
-    logger.error('[MSG91] Failed to parse incoming message', { error: err.message });
+    logger.error('[MSG91] Parse failed', { error: err.message });
     return null;
   }
 }
