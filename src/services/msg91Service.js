@@ -55,7 +55,7 @@ async function sendMessage(toNumber, payload, conversationId, leadId) {
     logger.debug('[MSG91] Sending payload', { to: toNumber, type: payload.type, payload: JSON.stringify(msg91Payload) });
 
     const response = await axios.post(
-      `${BASE_URL}/whatsapp/whatsapp-outbound-message/bulk/`,
+      msg91Payload.content_type === "template" ? `${BASE_URL}/whatsapp/whatsapp-outbound-message/bulk/` : `${BASE_URL}/whatsapp/whatsapp-outbound-message/`,
       msg91Payload,
       { headers: getHeaders(), timeout: 10000 }
     );
@@ -83,7 +83,12 @@ async function sendMessage(toNumber, payload, conversationId, leadId) {
 
 /**
  * Build MSG91-compatible payload structure.
- * MSG91 WhatsApp API v5 bulk format.
+ *
+ * MSG91 has TWO different APIs:
+ *  - Bulk endpoint (/bulk/)  → only for templates, uses { integrated_number, content_type, data: [...] }
+ *  - Standard endpoint       → for text/interactive, uses { integrated_number, to, message }
+ *
+ * content_type field on the returned object is used by the caller to pick the right endpoint.
  */
 function buildMSG91Payload(toNumber, payload) {
   const integrated_number = SENDER_NUMBER;
@@ -91,75 +96,61 @@ function buildMSG91Payload(toNumber, payload) {
   if (payload.type === 'text') {
     return {
       integrated_number,
+      to: toNumber,
       content_type: 'text',
-      data: [
-        {
-          to: toNumber,
-          type: 'text',
-          message: { text: payload.text },
-        },
-      ],
+      message: { text: payload.text },
     };
   }
 
   if (payload.type === 'button') {
     return {
       integrated_number,
+      to: toNumber,
       content_type: 'interactive',
-      data: [
-        {
-          to: toNumber,
-          type: 'interactive',
-          message: {
-            interactive: {
-              type: 'button',
-              body: { text: payload.body },
-              action: {
-                buttons: payload.buttons.map((btn, i) => ({
-                  type: 'reply',
-                  reply: { id: btn.id || `btn_${i}`, title: String(btn.label).slice(0, 20) },
-                })),
-              },
-            },
+      message: {
+        interactive: {
+          type: 'button',
+          body: { text: payload.body },
+          action: {
+            buttons: payload.buttons.map((btn, i) => ({
+              type: 'reply',
+              reply: { id: btn.id || `btn_${i}`, title: String(btn.label).slice(0, 20) },
+            })),
           },
         },
-      ],
+      },
     };
   }
 
   if (payload.type === 'list') {
     return {
       integrated_number,
+      to: toNumber,
       content_type: 'interactive',
-      data: [
-        {
-          to: toNumber,
-          type: 'interactive',
-          message: {
-            interactive: {
-              type: 'list',
-              body: { text: payload.body },
-              action: {
-                button: payload.buttonLabel || 'Select',
-                sections: payload.sections || [
-                  {
-                    title: payload.sectionTitle || 'Options',
-                    rows: (payload.options || []).map((opt, i) => ({
-                      id: opt.id || `opt_${i}`,
-                      title: String(opt.label).slice(0, 24),
-                      description: opt.description || '',
-                    })),
-                  },
-                ],
+      message: {
+        interactive: {
+          type: 'list',
+          body: { text: payload.body },
+          action: {
+            button: payload.buttonLabel || 'Select',
+            sections: payload.sections || [
+              {
+                title: payload.sectionTitle || 'Options',
+                rows: (payload.options || []).map((opt, i) => ({
+                  id: opt.id || `opt_${i}`,
+                  title: String(opt.label).slice(0, 24),
+                  description: opt.description || '',
+                })),
               },
-            },
+            ],
           },
         },
-      ],
+      },
     };
   }
 
   if (payload.type === 'template') {
+    // Templates use the bulk endpoint with data array
     return {
       integrated_number,
       content_type: 'template',
@@ -173,17 +164,12 @@ function buildMSG91Payload(toNumber, payload) {
     };
   }
 
-  // Fallback: plain text
+  // Fallback: plain text (standard endpoint)
   return {
     integrated_number,
+    to: toNumber,
     content_type: 'text',
-    data: [
-      {
-        to: toNumber,
-        type: 'text',
-        message: { text: payload.text || JSON.stringify(payload) },
-      },
-    ],
+    message: { text: payload.text || JSON.stringify(payload) },
   };
 }
 
