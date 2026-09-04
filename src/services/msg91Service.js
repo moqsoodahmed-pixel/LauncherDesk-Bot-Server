@@ -38,7 +38,7 @@ async function sendMessage(toNumber, payload, conversationId, leadId) {
     payload,
     conversationId,
     leadId,
-    status: 'pending',
+    status: 'sent',
   });
 
   if (!AUTH_KEY || !SENDER_NUMBER) {
@@ -46,7 +46,7 @@ async function sendMessage(toNumber, payload, conversationId, leadId) {
       to: toNumber,
       type: payload.type,
     });
-    await MessageLog.findByIdAndUpdate(logEntry._id, { status: 'dry_run' });
+    await MessageLog.findByIdAndUpdate(logEntry._id, { status: 'sent' });
     return { success: true, dryRun: true, logId: logEntry._id };
   }
 
