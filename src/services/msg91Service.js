@@ -441,6 +441,7 @@ function parseIncomingMessage(rawBody) {
 }
 
 module.exports = {
+  sendMessage,
   sendTextMessage,
   sendButtonMessage,
   sendListMessage,
