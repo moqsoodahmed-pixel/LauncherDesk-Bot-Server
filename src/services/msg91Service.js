@@ -43,7 +43,7 @@ async function sendMessage(toNumber, payload, conversationId, leadId) {
 
   if (!AUTH_KEY || !SENDER_NUMBER) {
     logger.warn('[MSG91] Credentials not configured. Message NOT sent (dry-run mode).', {
-      to: toNumber,
+      recipient_number: toNumber,
       type: payload.type,
     });
     await MessageLog.findByIdAndUpdate(logEntry._id, { status: 'sent' });
@@ -96,7 +96,7 @@ function buildMSG91Payload(toNumber, payload) {
   if (payload.type === 'text') {
     return {
       integrated_number,
-      to: toNumber,
+      recipient_number: toNumber,
       content_type: 'text',
       message: { text: payload.text },
     };
@@ -105,7 +105,7 @@ function buildMSG91Payload(toNumber, payload) {
   if (payload.type === 'button') {
     return {
       integrated_number,
-      to: toNumber,
+      recipient_number: toNumber,
       content_type: 'interactive',
       message: {
         interactive: {
@@ -125,7 +125,7 @@ function buildMSG91Payload(toNumber, payload) {
   if (payload.type === 'list') {
     return {
       integrated_number,
-      to: toNumber,
+      recipient_number: toNumber,
       content_type: 'interactive',
       message: {
         interactive: {
@@ -156,7 +156,7 @@ function buildMSG91Payload(toNumber, payload) {
       content_type: 'template',
       data: [
         {
-          to: toNumber,
+          recipient_number: toNumber,
           type: 'template',
           message: payload.template,
         },
@@ -167,7 +167,7 @@ function buildMSG91Payload(toNumber, payload) {
   // Fallback: plain text (standard endpoint)
   return {
     integrated_number,
-    to: toNumber,
+    recipient_number: toNumber,
     content_type: 'text',
     message: { text: payload.text || JSON.stringify(payload) },
   };
