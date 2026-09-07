@@ -97,6 +97,7 @@ async function processMessage(incomingMessage) {
         phase: 'menu',
         lastInteractionAt: new Date(),
       });
+      session._isNew = true; // mark so we know to send the menu
     }
 
     session.lastInteractionAt = new Date();
@@ -108,9 +109,16 @@ async function processMessage(incomingMessage) {
       return startServiceFlow(session, user, serviceMatch, normalizedFrom);
     }
 
-    // Unknown input on menu
+    // Unknown input on menu — only send menu if session was just created
+    // (isNew flag set below) or if user explicitly typed a menu command.
+    // This prevents duplicate menus when MSG91 fires the same webhook twice.
     await session.save();
-    return showServiceMenu(normalizedFrom, session._id);
+    if (session._isNew || MENU_COMMANDS.includes(lowerText)) {
+      return showServiceMenu(normalizedFrom, session._id);
+    }
+    // Duplicate webhook — silently ignore
+    logger.debug('[Engine] Suppressing duplicate menu send', { number: normalizedFrom });
+    return;
   }
 
   // Update last interaction

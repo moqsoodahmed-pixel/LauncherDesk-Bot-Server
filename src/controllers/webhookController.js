@@ -5,13 +5,8 @@ const { processMessage } = require('../engines/conversationEngine');
 const { parseIncomingMessage, processDeliveryStatus } = require('../services/msg91Service');
 const logger = require('../utils/logger');
 
-/**
- * Verify webhook authenticity using MSG91 signature.
- * If MSG91_WEBHOOK_SECRET is not set (or set to placeholder), skip verification.
- */
 function verifyMsg91Signature(rawBody, signature) {
   const secret = process.env.MSG91_WEBHOOK_SECRET;
-  // Skip if not configured or still set to placeholder
   if (!secret || secret === 'your_webhook_secret_here' || !signature) return true;
   try {
     const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
@@ -21,10 +16,6 @@ function verifyMsg91Signature(rawBody, signature) {
   }
 }
 
-/**
- * Safely parse request body — handles both Buffer (from express.raw) and
- * already-parsed JSON objects (from express.json).
- */
 function parseBody(reqBody) {
   if (Buffer.isBuffer(reqBody)) {
     return { raw: reqBody, parsed: JSON.parse(reqBody.toString()) };
@@ -33,14 +24,33 @@ function parseBody(reqBody) {
     const buf = Buffer.from(reqBody);
     return { raw: buf, parsed: JSON.parse(reqBody) };
   }
-  // Already parsed object — reconstruct raw buffer for signature check
   const str = JSON.stringify(reqBody);
   return { raw: Buffer.from(str), parsed: reqBody };
 }
 
 /**
+ * Build a stable idempotency key from the message.
+ *
+ * MSG91 sometimes fires the same webhook twice within milliseconds.
+ * We use fromNumber + messageId (if real) OR fromNumber + text + minute-bucket
+ * so that two fires of the same message in the same minute are collapsed.
+ */
+function buildEventId(parsedMessage, rawPayload) {
+  const { fromNumber, messageId, messageText } = parsedMessage;
+
+  // If MSG91 gave us a real message ID (not our local fallback), trust it
+  if (messageId && !messageId.startsWith('local_')) {
+    return `${fromNumber}_${messageId}`;
+  }
+
+  // Fallback: number + text + minute bucket — collapses duplicates within 60 s
+  const minuteBucket = Math.floor(Date.now() / 60000);
+  const textKey = (messageText || '').trim().toLowerCase().slice(0, 30);
+  return `${fromNumber}_${textKey}_${minuteBucket}`;
+}
+
+/**
  * POST /api/webhooks/msg91
- * Handle incoming WhatsApp messages from MSG91
  */
 exports.handleMsg91Webhook = async (req, res) => {
   const startTime = Date.now();
@@ -49,59 +59,48 @@ exports.handleMsg91Webhook = async (req, res) => {
   try {
     ({ raw, parsed } = parseBody(req.body));
   } catch (err) {
-    logger.error('[Webhook] Failed to parse request body', { error: err.message });
-    // Still return 200 so MSG91 doesn't retry
+    logger.error('[Webhook] Body parse failed', { error: err.message });
     return res.status(200).json({ success: true, message: 'Received' });
   }
 
   const signature = req.headers['x-msg91-signature'] || req.headers['x-webhook-signature'];
 
-  // Always respond 200 immediately to prevent MSG91 retries
+  // Respond 200 immediately so MSG91 doesn't retry
   res.status(200).json({ success: true, message: 'Webhook received' });
 
-  // Async processing after response sent
   setImmediate(async () => {
     try {
-      // Verify signature (skipped if secret not configured)
       if (!verifyMsg91Signature(raw, signature)) {
-        logger.warn('[Webhook] Invalid signature rejected');
+        logger.warn('[Webhook] Bad signature — ignored');
         return;
       }
 
-      logger.debug('[Webhook] Received payload', { payload: JSON.stringify(parsed) });
+      logger.debug('[Webhook] Payload', { payload: JSON.stringify(parsed) });
 
-      // Parse the incoming message
       const parsedMessage = parseIncomingMessage(parsed);
       if (!parsedMessage) {
-        logger.warn('[Webhook] Could not parse incoming message, raw payload logged', {
-          payload: JSON.stringify(parsed),
-        });
+        logger.warn('[Webhook] Unparseable payload', { raw: JSON.stringify(parsed) });
         return;
       }
 
-      // Create idempotency key
-      const eventId = parsedMessage.messageId || `${parsedMessage.fromNumber}_${Date.now()}`;
+      const eventId = buildEventId(parsedMessage, parsed);
 
-      // Check for duplicate processing
-      const existingEvent = await WebhookEvent.findOne({ eventId });
-      if (existingEvent) {
-        logger.info('[Webhook] Duplicate event ignored', { eventId });
-        await WebhookEvent.findByIdAndUpdate(existingEvent._id, { $inc: { retryCount: 1 } });
+      // ── Idempotency check — atomic findOneAndUpdate to avoid race conditions ──
+      const existing = await WebhookEvent.findOneAndUpdate(
+        { eventId },
+        { $inc: { retryCount: 1 }, $setOnInsert: { status: 'processing' } },
+        { upsert: true, new: false } // returns OLD doc (null if just inserted)
+      );
+
+      if (existing) {
+        // Doc already existed → duplicate
+        logger.info('[Webhook] Duplicate suppressed', { eventId, retryCount: existing.retryCount });
         return;
       }
 
-      // Store webhook event
-      const webhookEvent = await WebhookEvent.create({
-        provider: 'msg91',
-        eventId,
-        eventType: parsed.contentType || parsed.messageType || parsed.type || 'message',
-        rawPayload: parsed,
-        whatsappNumber: parsedMessage.fromNumber,
-        messageId: parsedMessage.messageId,
-        status: 'pending',
-      });
+      // First time seeing this event — process it
+      logger.info('[Webhook] Processing', { eventId, from: parsedMessage.fromNumber, text: parsedMessage.messageText });
 
-      // Log incoming message
       await MessageLog.create({
         direction: 'incoming',
         whatsappNumber: parsedMessage.fromNumber,
@@ -112,64 +111,54 @@ exports.handleMsg91Webhook = async (req, res) => {
         status: 'received',
       });
 
-      // Process message through conversation engine
       await processMessage(parsedMessage);
 
-      // Mark as processed
       const processingTime = Date.now() - startTime;
-      await WebhookEvent.findByIdAndUpdate(webhookEvent._id, {
-        status: 'processed',
-        processedAt: new Date(),
-        processingTimeMs: processingTime,
-      });
+      await WebhookEvent.findOneAndUpdate(
+        { eventId },
+        {
+          status: 'processed',
+          processedAt: new Date(),
+          processingTimeMs: processingTime,
+          provider: 'msg91',
+          eventType: parsed.contentType || parsed.messageType || 'message',
+          rawPayload: parsed,
+          whatsappNumber: parsedMessage.fromNumber,
+          messageId: parsedMessage.messageId,
+        }
+      );
 
-      logger.info('[Webhook] Message processed successfully', {
-        eventId,
-        from: parsedMessage.fromNumber,
-        text: parsedMessage.messageText,
-        processingTimeMs: processingTime,
-      });
+      logger.info('[Webhook] Done', { eventId, ms: processingTime });
     } catch (err) {
-      logger.error('[Webhook] Processing failed', { error: err.message, stack: err.stack });
+      logger.error('[Webhook] Processing error', { error: err.message, stack: err.stack });
     }
   });
 };
 
 /**
  * POST /api/webhooks/msg91/status
- * Handle delivery/read status updates
  */
 exports.handleDeliveryStatus = async (req, res) => {
   res.status(200).json({ success: true });
-
   let payload;
-  try {
-    ({ parsed: payload } = parseBody(req.body));
-  } catch {
-    return;
-  }
+  try { ({ parsed: payload } = parseBody(req.body)); } catch { return; }
 
   setImmediate(async () => {
     try {
       const messageId = payload.message_id || payload.id || payload.requestId;
       const status = payload.status || payload.message_status;
-      if (messageId && status) {
-        await processDeliveryStatus(messageId, status);
-      }
+      if (messageId && status) await processDeliveryStatus(messageId, status);
     } catch (err) {
-      logger.error('[Webhook] Status update failed', { error: err.message });
+      logger.error('[Webhook] Status update error', { error: err.message });
     }
   });
 };
 
 /**
  * GET /api/webhooks/msg91
- * Webhook verification challenge (if MSG91 requires it)
  */
 exports.verifyWebhook = (req, res) => {
   const challenge = req.query.challenge || req.query['hub.challenge'];
-  if (challenge) {
-    return res.status(200).send(challenge);
-  }
-  res.status(200).json({ status: 'Webhook endpoint active', service: 'LauncherDesk MSG91 Webhook' });
+  if (challenge) return res.status(200).send(challenge);
+  res.status(200).json({ status: 'active', service: 'LauncherDesk MSG91 Webhook' });
 };
